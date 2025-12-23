@@ -1,25 +1,29 @@
 /**
  * Stable multi-app router for Vercel apps under one domain (Cloudflare Workers)
  *
- * What you get:
- * 1) Strict mount routing (longest mount wins) -> never "everything becomes one app"
- * 2) Trailing-slash canonicalization for mount root:
- *      /academic/english-final -> /academic/english-final/
- *    (document navigation only)
- * 3) Fix missing CSS/JS/images caused by root-file requests (/style.css, /script.js, /xxx.png)
- *    by routing them to the correct app using Referer.
- * 4) Fallback: if not matched -> fetch origin (your main site).
- *    If origin 404 and it's a document navigation -> redirect to homepage "/".
+ * Minimal changes in this version:
+ * A) Force trailing slash for ALL browser navigations (document requests) when missing,
+ *    while NOT touching assets/files (css/js/png/robots.txt/_next/etc).
+ * B) If final response is 404 for a browser navigation, serve a placeholder page by
+ *    PROXYING https://example.com/ (address bar stays blueberryowo.me).
  *
  * IMPORTANT:
  * - Do NOT use mount "" or "/" in the table.
  */
 
+const NOT_FOUND_PLACEHOLDER = "https://example.com/"; // TODO: replace later
+
 const RAW_PROXIES = [
+  {
+    name: "interactive-analysis",
+    mount: "/academic/english-final",
+    upstreamOrigin: "https://interactive-analysis.vercel.app",
+    upstreamBase: "",
+  },
   {
     name: "merry-christmas",
     mount: "/cards/christmas",
-    upstreamOrigin: "https://this-is-an-example.vercel.app",
+    upstreamOrigin: "https://wish-you-a-merry-christmas.vercel.app",
     upstreamBase: "",
   },
 ];
@@ -48,57 +52,93 @@ export default {
   async fetch(request) {
     const url = new URL(request.url);
 
-    // 0) Canonicalize trailing slash for mount ROOT only:
-    //    /mount -> /mount/
-    //    (document navigation only; avoids breaking assets/api)
+    // 0) ✅ Force trailing slash for ALL browser navigations when missing
+    //    Example: /cards/christmas/zh-cn  -> /cards/christmas/zh-cn/
     const slashRedirect = maybeRedirectToTrailingSlash(request, url);
     if (slashRedirect) return slashRedirect;
 
     // 1) Mount match (longest mount wins)
     const mountHit = matchByMount(url.pathname);
     if (mountHit) {
-      return proxyToUpstreamStripMount(request, url, mountHit.proxy, mountHit.mountUsed);
+      const resp = await proxyToUpstreamStripMount(request, url, mountHit.proxy, mountHit.mountUsed);
+      return await maybeServePlaceholder404(request, url, resp);
     }
 
     // 2) Root asset prefixes: route by Referer
     const prefixHit = matchRootAssetByReferer(request, url.pathname);
     if (prefixHit) {
-      return proxyToUpstreamKeepPath(request, url, prefixHit.proxy, prefixHit.mountUsed);
+      const resp = await proxyToUpstreamKeepPath(request, url, prefixHit.proxy, prefixHit.mountUsed);
+      return resp;
     }
 
     // 3) Root single-file assets (your style.css/script.js/*.png case): route by Referer
     const rootFileHit = matchRootFileByReferer(request, url.pathname);
     if (rootFileHit) {
-      return proxyToUpstreamKeepPath(request, url, rootFileHit.proxy, rootFileHit.mountUsed);
+      const resp = await proxyToUpstreamKeepPath(request, url, rootFileHit.proxy, rootFileHit.mountUsed);
+      return resp;
     }
 
     // 4) Not in table: let origin (your main site) handle it
     const originResp = await fetch(request);
-
-    // If origin 404 and it's a document navigation, redirect to homepage "/"
-    if (originResp.status === 404 && isDocumentNavigation(request, url) && url.pathname !== "/") {
-      return Response.redirect(new URL("/", url.origin).toString(), 302);
-    }
-
-    return originResp;
+    return await maybeServePlaceholder404(request, url, originResp);
   },
 };
 
 // ---------------- trailing slash canonicalization ----------------
 
 function maybeRedirectToTrailingSlash(request, url) {
+  // Only for browser navigations (document), and only GET/HEAD
   if (!isDocumentNavigation(request, url)) return null;
 
-  // Only redirect exact mount path without trailing slash
-  for (const p of PROXIES) {
-    if (url.pathname === p.mount) {
-      const to = new URL(url.toString());
-      to.pathname = p.mount + "/";
-      // 308 = permanent redirect, preserves method (safe even if not GET)
-      return Response.redirect(to.toString(), 308);
-    }
+  const p = url.pathname;
+
+  // Already OK
+  if (p === "/" || p.endsWith("/")) return null;
+
+  // Do NOT touch obvious assets/files/special paths
+  if (isAssetLikePath(p)) return null;
+
+  // ✅ Add slash (same domain)
+  const to = new URL(url.toString());
+  to.pathname = p + "/";
+  // 308 = permanent redirect, preserves method
+  return Response.redirect(to.toString(), 308);
+}
+
+function isAssetLikePath(pathname) {
+  // 1) has file extension like .css/.js/.png...
+  const last = pathname.split("/").pop() || "";
+  const m = last.match(/\.([a-z0-9]+)$/i);
+  if (m && ROOT_FILE_EXTS.has(m[1].toLowerCase())) return true;
+
+  // 2) matches known asset prefixes (including ones without dot, e.g. /favicon, /sitemap)
+  for (const pref of ROOT_ASSET_PREFIXES) {
+    if (pathname === pref || pathname.startsWith(pref)) return true;
+    // also treat "/favicon" as a prefix for "/favicon.ico"
+    if (pref.endsWith("/") === false && pathname.startsWith(pref)) return true;
   }
-  return null;
+
+  // 3) .well-known should not be modified
+  if (pathname === "/.well-known" || pathname.startsWith("/.well-known/")) return true;
+
+  return false;
+}
+
+// ---------------- placeholder 404 (proxy example.com) ----------------
+
+async function maybeServePlaceholder404(request, url, resp) {
+  // Only replace 404 for browser navigations
+  if (resp.status !== 404) return resp;
+  if (!isDocumentNavigation(request, url)) return resp;
+
+  // Proxy the placeholder page (address bar stays blueberryowo.me)
+  const ph = await fetch(NOT_FOUND_PLACEHOLDER, { redirect: "follow" });
+
+  const h = new Headers(ph.headers);
+  h.set("cache-control", "no-store");
+  h.set("X-NotFound-Placeholder", "1");
+
+  return new Response(ph.body, { status: 404, headers: h });
 }
 
 // ---------------- matching ----------------
@@ -330,7 +370,8 @@ function isDocumentNavigation(request, url) {
 
   const accept = request.headers.get("Accept") || "";
   const secDest = request.headers.get("Sec-Fetch-Dest") || "";
-  const looksLikeDoc = accept.includes("text/html") || secDest === "document";
+  const secMode = request.headers.get("Sec-Fetch-Mode") || "";
+  const looksLikeDoc = accept.includes("text/html") || secDest === "document" || secMode === "navigate";
 
   // Don't treat obvious assets as doc navigations
   if (/\.(css|js|mjs|png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|map)$/i.test(url.pathname)) {
